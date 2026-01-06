@@ -43,53 +43,62 @@ class TestRunner:
     def __init__(self):
         self.passed = 0
         self.failed = 0
-        self.hook_path = Path(__file__).parent.parent / '.claude' / 'hooks' / 'agent-armor-security.py'
 
-        if not self.hook_path.exists():
-            print(f"{RED}ERROR: Hook not found at {self.hook_path}{RESET}")
-            sys.exit(1)
+        # Tool-specific hooks (new architecture)
+        base_path = Path(__file__).parent.parent / '.claude' / 'hooks' / 'agent-armor'
+        self.bash_hook = base_path / 'bash-tool-agent-armor.py'
+        self.edit_hook = base_path / 'edit-tool-agent-armor.py'
+        self.write_hook = base_path / 'write-tool-agent-armor.py'
 
-        # SAFETY: Verify hook script doesn't contain dangerous execution patterns
+        # Verify all hooks exist
+        for hook_name, hook_path in [('Bash', self.bash_hook), ('Edit', self.edit_hook), ('Write', self.write_hook)]:
+            if not hook_path.exists():
+                print(f"{RED}ERROR: {hook_name} hook not found at {hook_path}{RESET}")
+                sys.exit(1)
+
+        # SAFETY: Verify hook scripts don't contain dangerous execution patterns
         self._verify_hook_safety()
 
     def _verify_hook_safety(self):
         """
-        Safety check: Ensure hook script doesn't execute commands.
+        Safety check: Ensure hook scripts don't execute commands.
 
-        This is a paranoid safety check to ensure the hook only does pattern
-        matching and never actually executes the commands it's testing.
+        This is a paranoid safety check to ensure the hooks only do pattern
+        matching and never actually execute the commands they're testing.
         """
-        with open(self.hook_path, 'r') as f:
-            hook_content = f.read()
+        # Check all three hooks
+        for hook_name, hook_path in [('Bash', self.bash_hook), ('Edit', self.edit_hook), ('Write', self.write_hook)]:
+            with open(hook_path, 'r') as f:
+                hook_content = f.read()
 
-        # Check for dangerous patterns that would indicate command execution
-        dangerous_patterns = [
-            'subprocess.call',
-            'subprocess.Popen',
-            'os.system',
-            'os.popen',
-            'exec(',
-            'eval(',
-            '__import__',
-        ]
+            # Check for dangerous patterns that would indicate command execution
+            dangerous_patterns = [
+                'subprocess.call',
+                'subprocess.Popen',
+                'os.system',
+                'os.popen',
+                'exec(',
+                'eval(',
+                '__import__',
+            ]
 
-        found_dangerous = []
-        for pattern in dangerous_patterns:
-            if pattern in hook_content:
-                # Filter out comments and strings
-                lines = hook_content.split('\n')
-                for i, line in enumerate(lines, 1):
-                    if pattern in line and not line.strip().startswith('#'):
-                        found_dangerous.append(f"Line {i}: {line.strip()}")
+            found_dangerous = []
+            for pattern in dangerous_patterns:
+                if pattern in hook_content:
+                    # Filter out comments and strings
+                    lines = hook_content.split('\n')
+                    for i, line in enumerate(lines, 1):
+                        if pattern in line and not line.strip().startswith('#'):
+                            found_dangerous.append(f"{hook_name} Line {i}: {line.strip()}")
 
-        if found_dangerous:
-            print(f"{RED}SAFETY ERROR: Hook script contains dangerous patterns:{RESET}")
-            for item in found_dangerous:
-                print(f"  {item}")
-            print(f"\n{RED}Hook script should ONLY do pattern matching, never execute commands.{RESET}")
-            sys.exit(1)
+            if found_dangerous:
+                print(f"{RED}SAFETY ERROR: {hook_name} hook contains dangerous patterns:{RESET}")
+                for item in found_dangerous:
+                    print(f"  {item}")
+                print(f"\n{RED}Hook scripts should ONLY do pattern matching, never execute commands.{RESET}")
+                sys.exit(1)
 
-        print(f"{BLUE}✓ Safety check passed: Hook script contains no command execution{RESET}")
+        print(f"{BLUE}✓ Safety check passed: All hook scripts contain no command execution{RESET}")
 
     def run_hook(self, tool_name: str, tool_input: dict) -> tuple:
         """
@@ -104,6 +113,19 @@ class TestRunner:
         Returns:
             (exit_code, stdout, stderr)
         """
+        # Select appropriate hook based on tool_name
+        if tool_name == 'Bash':
+            hook_path = self.bash_hook
+        elif tool_name == 'Edit':
+            hook_path = self.edit_hook
+        elif tool_name == 'Write':
+            hook_path = self.write_hook
+        elif tool_name == 'Read':
+            # Read uses the Edit hook logic (zero-access and read-only checks)
+            hook_path = self.edit_hook
+        else:
+            hook_path = self.bash_hook  # Fallback
+
         input_data = {
             'tool_name': tool_name,
             'tool_input': tool_input
@@ -113,8 +135,8 @@ class TestRunner:
 
         # SAFETY: We only run the hook script, not the command being tested
         result = subprocess.run(
-            ['python3', str(self.hook_path)],  # Only the hook script
-            input=input_json,                   # JSON input, not shell commands
+            ['python3', str(hook_path)],  # Only the hook script
+            input=input_json,               # JSON input, not shell commands
             capture_output=True,
             text=True,
             env={**os.environ, 'CLAUDE_PROJECT_DIR': str(Path(__file__).parent.parent)}
@@ -402,6 +424,50 @@ def main():
         "Edit",
         {"file_path": "/nonexistent/project/README.md"},
         should_block=False
+    )
+
+    # =========================================================================
+    # CASE-INSENSITIVE SECURITY MATCHING TESTS (new feature)
+    # =========================================================================
+    print(f"\n{YELLOW}Testing Case-Insensitive Security Matching{RESET}")
+
+    runner.test(
+        "Block .ENV (uppercase) - case-insensitive security",
+        "Read",
+        {"file_path": "/nonexistent/project/.ENV"},
+        should_block=True,
+        expected_msg="No access"
+    )
+
+    runner.test(
+        "Block .Env (mixed case) - case-insensitive security",
+        "Write",
+        {"file_path": "/nonexistent/project/.Env"},
+        should_block=True,
+        expected_msg="No access"
+    )
+
+    runner.test(
+        "Block ~/.SSH/id_rsa (uppercase directory) - case-insensitive",
+        "Read",
+        {"file_path": f"{home}/.SSH/id_rsa"},
+        should_block=True,
+        expected_msg="No access"
+    )
+
+    runner.test(
+        "Block cert.PEM (uppercase extension) - case-insensitive",
+        "Edit",
+        {"file_path": "/nonexistent/cert.PEM"},
+        should_block=True,
+        expected_msg="No access"
+    )
+
+    runner.test(
+        "Allow PACKAGE-LOCK.JSON (uppercase) - read-only is case-sensitive, so uppercase doesn't match",
+        "Write",
+        {"file_path": "/nonexistent/project/PACKAGE-LOCK.JSON"},
+        should_block=False  # Read-only paths are case-sensitive, uppercase won't match
     )
 
     # =========================================================================
